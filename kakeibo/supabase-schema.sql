@@ -11,6 +11,7 @@ CREATE TABLE records (
   amount NUMERIC(15,2) NOT NULL CHECK (amount > 0),
   category TEXT NOT NULL,
   note TEXT DEFAULT '',
+  note_lang TEXT DEFAULT 'zh-TW',
   date DATE NOT NULL DEFAULT CURRENT_DATE,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()

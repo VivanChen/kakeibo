@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react'
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { supabase, isDemoMode } from './supabase.js'
 import { translations, categoryIcons, expenseCategories, incomeCategories } from './i18n.js'
 import * as XLSX from 'xlsx'
@@ -7,6 +7,106 @@ import * as XLSX from 'xlsx'
 const genId = () => crypto.randomUUID?.() || Date.now().toString(36) + Math.random().toString(36).slice(2)
 const today = () => new Date().toISOString().slice(0, 10)
 const fmtMoney = (n, sym) => `${sym}${Math.abs(n).toLocaleString()}`
+
+// ─── Translation Service ───
+// Uses MyMemory free API (1000 words/day free, no key needed)
+// lang mapping: 'zh-TW' → 'zh-TW', 'id' → 'id'
+const transCache = {}
+
+async function translateText(text, fromLang, toLang) {
+  if (!text || !text.trim() || fromLang === toLang) return text
+  const cacheKey = `${fromLang}|${toLang}|${text}`
+  if (transCache[cacheKey]) return transCache[cacheKey]
+
+  // Map our lang codes to MyMemory format
+  const langMap = { 'zh-TW': 'zh-TW', 'id': 'id' }
+  const from = langMap[fromLang] || fromLang
+  const to = langMap[toLang] || toLang
+
+  try {
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${from}|${to}`
+    const res = await fetch(url)
+    const data = await res.json()
+    if (data.responseStatus === 200 && data.responseData?.translatedText) {
+      const translated = data.responseData.translatedText
+      transCache[cacheKey] = translated
+      return translated
+    }
+  } catch (e) {
+    console.warn('Translation failed:', e)
+  }
+  return text // fallback to original
+}
+
+async function translateBatch(items, fromLangField, toLang) {
+  // Translate an array of {note, note_lang} objects
+  const results = await Promise.all(
+    items.map(async (item) => {
+      if (!item.note || !item.note.trim()) return ''
+      const from = item[fromLangField] || 'zh-TW'
+      if (from === toLang) return item.note
+      return await translateText(item.note, from, toLang)
+    })
+  )
+  return results
+}
+
+// ─── Hook: useTranslatedRecords ───
+// Translates note fields when viewer's lang differs from record's note_lang
+function useTranslatedNotes(records, viewerLang) {
+  const [noteMap, setNoteMap] = useState({}) // id → translated note
+  const pendingRef = useRef(new Set())
+
+  useEffect(() => {
+    if (!records.length) return
+    let cancelled = false
+
+    const toTranslate = records.filter(r => {
+      if (!r.note || !r.note.trim()) return false
+      const noteLang = r.note_lang || 'zh-TW'
+      if (noteLang === viewerLang) return false
+      if (noteMap[`${r.id}_${viewerLang}`]) return false
+      if (pendingRef.current.has(`${r.id}_${viewerLang}`)) return false
+      return true
+    })
+
+    if (!toTranslate.length) return
+
+    toTranslate.forEach(r => pendingRef.current.add(`${r.id}_${viewerLang}`))
+
+    // Translate in small batches to avoid rate limiting
+    const processBatch = async () => {
+      const newMap = {}
+      for (const r of toTranslate) {
+        if (cancelled) break
+        const translated = await translateText(r.note, r.note_lang || 'zh-TW', viewerLang)
+        newMap[`${r.id}_${viewerLang}`] = translated
+      }
+      if (!cancelled) {
+        setNoteMap(prev => ({ ...prev, ...newMap }))
+      }
+    }
+    processBatch()
+
+    return () => { cancelled = true }
+  }, [records, viewerLang])
+
+  const getNote = useCallback((record) => {
+    if (!record.note || !record.note.trim()) return ''
+    const noteLang = record.note_lang || 'zh-TW'
+    if (noteLang === viewerLang) return record.note
+    return noteMap[`${record.id}_${viewerLang}`] || record.note
+  }, [noteMap, viewerLang])
+
+  const isTranslated = useCallback((record) => {
+    if (!record.note || !record.note.trim()) return false
+    const noteLang = record.note_lang || 'zh-TW'
+    if (noteLang === viewerLang) return false
+    return !!noteMap[`${record.id}_${viewerLang}`]
+  }, [noteMap, viewerLang])
+
+  return { getNote, isTranslated }
+}
 
 // ─── Styles ───
 const CSS = `
@@ -27,7 +127,6 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);
 input,select,textarea,button{font-family:inherit;font-size:inherit}
 button{cursor:pointer;border:none;background:none;color:inherit}
 
-/* Animations */
 @keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
 @keyframes slideIn{from{opacity:0;transform:translateY(100%)}to{opacity:1;transform:translateY(0)}}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
@@ -36,7 +135,6 @@ button{cursor:pointer;border:none;background:none;color:inherit}
 .fade-up{animation:fadeUp .35s ease both}
 .stagger-1{animation-delay:.05s}.stagger-2{animation-delay:.1s}.stagger-3{animation-delay:.15s}
 
-/* Layout */
 .app{max-width:480px;margin:0 auto;min-height:100dvh;position:relative;padding-bottom:80px}
 .header{padding:16px 20px 12px;display:flex;align-items:center;justify-content:space-between;
   position:sticky;top:0;z-index:50;background:var(--bg);border-bottom:1px solid rgba(255,255,255,.04)}
@@ -46,7 +144,6 @@ button{cursor:pointer;border:none;background:none;color:inherit}
   background:var(--surface);transition:all .2s;font-size:1.1rem}
 .icon-btn:hover,.icon-btn:active{background:var(--surface2);transform:scale(1.05)}
 
-/* Summary Cards */
 .summary{padding:8px 20px 16px;display:flex;flex-direction:column;gap:10px}
 .balance-card{background:linear-gradient(135deg,var(--accent),#8b5cf6);border-radius:var(--radius);
   padding:20px 22px;color:#fff;position:relative;overflow:hidden}
@@ -63,14 +160,12 @@ button{cursor:pointer;border:none;background:none;color:inherit}
 .summary-card.income .value{color:var(--income)}
 .summary-card.expense .value{color:var(--expense)}
 
-/* Month Navigation */
 .month-nav{display:flex;align-items:center;justify-content:center;gap:16px;padding:6px 20px 14px}
 .month-nav button{width:32px;height:32px;border-radius:50%;background:var(--surface);
   display:flex;align-items:center;justify-content:center;font-size:.9rem;transition:all .2s}
 .month-nav button:active{transform:scale(.9)}
 .month-nav span{font-size:.92rem;font-weight:500;min-width:120px;text-align:center}
 
-/* Records List */
 .records{padding:0 20px}
 .date-group{margin-bottom:16px}
 .date-label{font-size:.72rem;color:var(--text3);font-weight:500;padding:0 2px 6px;
@@ -85,6 +180,7 @@ button{cursor:pointer;border:none;background:none;color:inherit}
 .record-cat{font-size:.85rem;font-weight:500}
 .record-note{font-size:.72rem;color:var(--text3);margin-top:1px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.record-note .translated-badge{font-size:.6rem;color:var(--accent2);margin-left:4px;opacity:.7}
 .record-amount{font-family:var(--mono);font-weight:600;font-size:.95rem;text-align:right;flex-shrink:0}
 .record-amount.income{color:var(--income)}
 .record-amount.expense{color:var(--expense)}
@@ -93,14 +189,12 @@ button{cursor:pointer;border:none;background:none;color:inherit}
 .empty-state .emoji{font-size:3rem;margin-bottom:12px}
 .empty-state p{font-size:.88rem}
 
-/* FAB */
 .fab{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);width:56px;height:56px;
   border-radius:50%;background:var(--accent);color:#fff;font-size:1.8rem;display:flex;
   align-items:center;justify-content:center;box-shadow:0 4px 20px var(--accent-glow);
   z-index:100;transition:all .2s}
 .fab:active{transform:translateX(-50%) scale(.9)}
 
-/* Bottom Sheet / Modal */
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;
   opacity:0;transition:opacity .25s;pointer-events:none}
 .overlay.open{opacity:1;pointer-events:all}
@@ -113,7 +207,6 @@ button{cursor:pointer;border:none;background:none;color:inherit}
   margin:10px auto 16px;opacity:.5}
 .sheet-title{font-size:1.05rem;font-weight:600;margin-bottom:18px;text-align:center}
 
-/* Form */
 .type-toggle{display:flex;gap:8px;margin-bottom:18px}
 .type-btn{flex:1;padding:10px;border-radius:var(--radius-sm);font-weight:500;
   font-size:.88rem;border:1.5px solid var(--surface3);transition:all .2s}
@@ -144,14 +237,12 @@ button{cursor:pointer;border:none;background:none;color:inherit}
 .btn-secondary{width:100%;padding:11px;border-radius:var(--radius-sm);margin-top:6px;
   border:1.5px solid var(--surface3);color:var(--text2);font-weight:500;font-size:.88rem}
 
-/* Language Picker */
 .lang-picker{display:flex;gap:8px;padding:8px 0}
 .lang-btn{flex:1;padding:14px;border-radius:var(--radius-sm);border:1.5px solid var(--surface3);
   text-align:center;transition:all .2s;font-size:.92rem}
 .lang-btn.active{border-color:var(--accent);background:var(--accent-glow)}
 .lang-btn .flag{font-size:1.5rem;display:block;margin-bottom:4px}
 
-/* Auth */
 .auth-page{display:flex;flex-direction:column;align-items:center;justify-content:center;
   min-height:100dvh;padding:32px 24px}
 .auth-logo{font-size:2.5rem;margin-bottom:8px}
@@ -162,18 +253,13 @@ button{cursor:pointer;border:none;background:none;color:inherit}
 .auth-switch{font-size:.82rem;color:var(--accent2);text-align:center;margin-top:16px;
   background:none;border:none;cursor:pointer;text-decoration:underline}
 .auth-error{font-size:.78rem;color:var(--danger);text-align:center;margin-top:8px}
-.auth-demo{margin-top:20px;font-size:.78rem;color:var(--text3);text-align:center;
-  padding:10px 16px;border-radius:var(--radius-sm);background:var(--surface);border:1px dashed var(--surface3)}
 
-/* Demo Banner */
 .demo-banner{background:linear-gradient(90deg,rgba(108,92,231,.15),rgba(0,206,201,.1));
   text-align:center;padding:6px 16px;font-size:.72rem;color:var(--accent2);font-weight:500}
 
-/* Sync indicator */
 .sync-dot{width:6px;height:6px;border-radius:50%;background:var(--income);
   animation:pulse 2s infinite;display:inline-block;margin-right:6px}
 
-/* Confirm Dialog */
 .confirm-overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:300;
   display:flex;align-items:center;justify-content:center;padding:24px}
 .confirm-box{background:var(--surface);border-radius:var(--radius);padding:24px;
@@ -184,7 +270,13 @@ button{cursor:pointer;border:none;background:none;color:inherit}
 .confirm-actions .yes{background:var(--danger);color:#fff}
 .confirm-actions .no{background:var(--surface2);color:var(--text2)}
 
-/* Scrollbar */
+/* Export loading */
+.export-loading{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:300;
+  display:flex;align-items:center;justify-content:center}
+.export-loading-box{background:var(--surface);border-radius:var(--radius);padding:24px 32px;
+  text-align:center;font-size:.88rem}
+.export-loading-box .spinner{animation:pulse 1s infinite;font-size:1.5rem;margin-bottom:8px}
+
 ::-webkit-scrollbar{width:4px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--surface3);border-radius:2px}
@@ -210,13 +302,16 @@ export default function App() {
   const [editingRecord, setEditingRecord] = useState(null)
   const [showSettings, setShowSettings] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(null)
+  const [exporting, setExporting] = useState(false)
   const [viewMonth, setViewMonth] = useState(() => {
     const d = new Date(); return { year: d.getFullYear(), month: d.getMonth() }
   })
 
   const t = translations[lang]
 
-  // Persist language
+  // Translation hook for record notes
+  const { getNote, isTranslated } = useTranslatedNotes(records, lang)
+
   useEffect(() => { localStorage.setItem(LS_LANG, lang) }, [lang])
 
   // Auth check
@@ -248,7 +343,6 @@ export default function App() {
       if (data) setRecords(data)
     }
     fetchRecords()
-    // Realtime subscription
     const channel = supabase
       .channel('records_changes')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'records' }, () => {
@@ -258,23 +352,25 @@ export default function App() {
     return () => supabase.removeChannel(channel)
   }, [user])
 
-  // Save record
+  // Save record — now includes note_lang
   const handleSave = async (record) => {
+    const recordWithLang = { ...record, note_lang: lang }
+
     if (isDemoMode) {
       let updated
-      if (record.id && records.find(r => r.id === record.id)) {
-        updated = records.map(r => r.id === record.id ? { ...r, ...record } : r)
+      if (recordWithLang.id && records.find(r => r.id === recordWithLang.id)) {
+        updated = records.map(r => r.id === recordWithLang.id ? { ...r, ...recordWithLang } : r)
       } else {
-        const newRec = { ...record, id: genId(), user_email: 'demo', created_at: new Date().toISOString() }
+        const newRec = { ...recordWithLang, id: genId(), user_email: 'demo', created_at: new Date().toISOString() }
         updated = [newRec, ...records]
       }
       setRecords(updated)
       saveLocalRecords(updated)
     } else {
-      if (record.id) {
-        await supabase.from('records').update(record).eq('id', record.id)
+      if (recordWithLang.id) {
+        await supabase.from('records').update(recordWithLang).eq('id', recordWithLang.id)
       } else {
-        await supabase.from('records').insert({ ...record, user_email: user.email })
+        await supabase.from('records').insert({ ...recordWithLang, user_email: user.email })
       }
     }
     setShowForm(false)
@@ -324,7 +420,6 @@ export default function App() {
     return { income: inc, expense: exp, balance: inc - exp }
   }, [filtered])
 
-  // Navigate month
   const navMonth = (dir) => {
     setViewMonth(prev => {
       let m = prev.month + dir, y = prev.year
@@ -334,19 +429,43 @@ export default function App() {
     })
   }
 
-  // Export Excel
-  const exportExcel = () => {
-    const data = filtered.map(r => ({
-      [t.date]: r.date,
-      [t.category]: t.categories[r.category] || r.category,
-      [t.amount]: r.type === 'expense' ? -r.amount : r.amount,
-      [t.note]: r.note || '',
-      [t.createdBy]: r.user_email || '',
-    }))
-    const ws = XLSX.utils.json_to_sheet(data)
-    const wb = XLSX.utils.book_new()
-    XLSX.utils.book_append_sheet(wb, ws, t.thisMonth)
-    XLSX.writeFile(wb, `cashflow_${viewMonth.year}_${viewMonth.month + 1}.xlsx`)
+  // Export Excel — with translated notes
+  const exportExcel = async () => {
+    setExporting(true)
+    try {
+      // Translate all notes for export
+      const translatedNotes = await Promise.all(
+        filtered.map(async (r) => {
+          if (!r.note || !r.note.trim()) return ''
+          const noteLang = r.note_lang || 'zh-TW'
+          if (noteLang === lang) return r.note
+          return await translateText(r.note, noteLang, lang)
+        })
+      )
+
+      const data = filtered.map((r, i) => ({
+        [t.date]: r.date,
+        [t.category]: t.categories[r.category] || r.category,
+        [t.amount]: r.type === 'expense' ? -r.amount : r.amount,
+        [t.note]: translatedNotes[i] || r.note || '',
+        [`${t.note} (${lang === 'zh-TW' ? '原文' : 'Asli'})`]: (r.note_lang && r.note_lang !== lang) ? r.note : '',
+        [t.createdBy]: r.user_email || '',
+      }))
+      const ws = XLSX.utils.json_to_sheet(data)
+
+      // Auto column width
+      const colWidths = Object.keys(data[0] || {}).map(k => ({
+        wch: Math.max(k.length * 2, ...data.map(d => String(d[k] || '').length * 1.5), 10)
+      }))
+      ws['!cols'] = colWidths
+
+      const wb = XLSX.utils.book_new()
+      XLSX.utils.book_append_sheet(wb, ws, t.thisMonth)
+      XLSX.writeFile(wb, `cashflow_${viewMonth.year}_${viewMonth.month + 1}.xlsx`)
+    } catch (e) {
+      console.error('Export error:', e)
+    }
+    setExporting(false)
   }
 
   if (!authChecked) return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100dvh' }}>
@@ -361,23 +480,22 @@ export default function App() {
       <div className="app">
         {isDemoMode && <div className="demo-banner">⚡ {t.demoMode}</div>}
         
-        {/* Header */}
         <div className="header">
           <h1>💰 {t.appName}</h1>
           <div className="header-actions">
-            <button className="icon-btn" onClick={exportExcel} title={t.exportExcel}>📊</button>
+            <button className="icon-btn" onClick={exportExcel} title={t.exportExcel} disabled={exporting}>
+              {exporting ? '⏳' : '📊'}
+            </button>
             <button className="icon-btn" onClick={() => setShowSettings(true)} title={t.settings}>⚙️</button>
           </div>
         </div>
 
-        {/* Month Nav */}
         <div className="month-nav fade-up">
           <button onClick={() => navMonth(-1)}>◀</button>
           <span>{viewMonth.year} {t.months[viewMonth.month]}</span>
           <button onClick={() => navMonth(1)}>▶</button>
         </div>
 
-        {/* Summary */}
         <div className="summary fade-up stagger-1">
           <div className="balance-card">
             <div className="balance-label">{t.balance}</div>
@@ -395,7 +513,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Records */}
         <div className="records">
           {grouped.length === 0 ? (
             <div className="empty-state fade-up stagger-2">
@@ -411,7 +528,12 @@ export default function App() {
                   <div className="record-icon">{categoryIcons[r.category] || '📌'}</div>
                   <div className="record-info">
                     <div className="record-cat">{t.categories[r.category] || r.category}</div>
-                    {r.note && <div className="record-note">{r.note}</div>}
+                    {r.note && (
+                      <div className="record-note">
+                        {getNote(r)}
+                        {isTranslated(r) && <span className="translated-badge">🌐</span>}
+                      </div>
+                    )}
                   </div>
                   <div>
                     <div className={`record-amount ${r.type}`}>
@@ -427,10 +549,8 @@ export default function App() {
           ))}
         </div>
 
-        {/* FAB */}
         <button className="fab" onClick={() => { setEditingRecord(null); setShowForm(true) }}>+</button>
 
-        {/* Form Sheet */}
         <div className={`overlay ${showForm ? 'open' : ''}`} onClick={() => { setShowForm(false); setEditingRecord(null) }} />
         <div className={`sheet ${showForm ? 'open' : ''}`}>
           <div className="sheet-handle" />
@@ -440,7 +560,6 @@ export default function App() {
             onCancel={() => { setShowForm(false); setEditingRecord(null) }} />
         </div>
 
-        {/* Settings Sheet */}
         <div className={`overlay ${showSettings ? 'open' : ''}`} onClick={() => setShowSettings(false)} />
         <div className={`sheet ${showSettings ? 'open' : ''}`}>
           <div className="sheet-handle" />
@@ -467,7 +586,6 @@ export default function App() {
           )}
         </div>
 
-        {/* Confirm Delete */}
         {confirmDelete && (
           <div className="confirm-overlay" onClick={() => setConfirmDelete(null)}>
             <div className="confirm-box" onClick={e => e.stopPropagation()}>
@@ -476,6 +594,15 @@ export default function App() {
                 <button className="no" onClick={() => setConfirmDelete(null)}>{t.no}</button>
                 <button className="yes" onClick={() => handleDelete(confirmDelete)}>{t.yes}</button>
               </div>
+            </div>
+          </div>
+        )}
+
+        {exporting && (
+          <div className="export-loading">
+            <div className="export-loading-box">
+              <div className="spinner">📊</div>
+              <div>{lang === 'id' ? 'Menerjemahkan & mengekspor...' : '翻譯並匯出中...'}</div>
             </div>
           </div>
         )}
@@ -544,7 +671,8 @@ function RecordForm({ t, lang, record, onSave, onDelete, onCancel }) {
 
       <div className="form-group">
         <label className="form-label">{t.note}</label>
-        <input className="form-input" type="text" placeholder={t.note}
+        <input className="form-input" type="text"
+          placeholder={lang === 'id' ? 'Tulis dalam bahasa Anda' : '用你的語言寫備註'}
           value={note} onChange={e => setNote(e.target.value)} />
       </div>
 
