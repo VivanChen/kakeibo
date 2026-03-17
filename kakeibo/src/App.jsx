@@ -6,7 +6,7 @@ import * as XLSX from 'xlsx'
 // ─── Helpers ───
 const genId = () => crypto.randomUUID?.() || Date.now().toString(36) + Math.random().toString(36).slice(2)
 const today = () => new Date().toISOString().slice(0, 10)
-const fmtMoney = (n, sym) => `${sym}${Math.abs(n).toLocaleString()}`
+const fmtMoney = (n, sym) => `${n < 0 ? '-' : ''}${sym}${Math.abs(n).toLocaleString()}`
 
 // ─── Translation Service ───
 // Uses MyMemory free API (1000 words/day free, no key needed)
